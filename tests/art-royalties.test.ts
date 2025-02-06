@@ -63,3 +63,6 @@ describe("art-royalties", () => {
     );
   });
 });
+
+
+// TODO: WRITE NEW CONTRACT TESTS

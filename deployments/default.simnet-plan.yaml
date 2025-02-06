@@ -52,6 +52,6 @@ plan:
         - emulated-contract-publish:
             contract-name: art-royalties
             emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            path: "contracts\\art-royalties.clar"
+            path: contracts/art-royalties.clar
             clarity-version: 3
       epoch: "3.1"
