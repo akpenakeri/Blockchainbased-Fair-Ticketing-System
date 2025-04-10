@@ -449,3 +449,99 @@
 ;; Track collaborative artwork IDs
 (define-data-var next-collab-id uint u1)
 
+(define-map exclusive-content
+    uint
+    {
+        artist: principal,
+        title: (string-ascii 100),
+        start-block: uint,
+        end-block: uint,
+        active: bool
+    }
+)
+
+(define-data-var next-exclusive-id uint u1)
+
+(define-public (create-exclusive-content (title (string-ascii 100)) (duration uint))
+    (let 
+        ((content-id (var-get next-exclusive-id))
+         (current-block stacks-block-height))
+        (map-set exclusive-content content-id
+            {
+                artist: tx-sender,
+                title: title,
+                start-block: current-block,
+                end-block: (+ current-block duration),
+                active: true
+            }
+        )
+        (var-set next-exclusive-id (+ content-id u1))
+        (ok content-id)
+    )
+)
+
+(define-read-only (can-access-exclusive (subscriber principal) (content-id uint))
+    (let 
+        ((content (unwrap! (map-get? exclusive-content content-id) false))
+         (current-block stacks-block-height))
+        (and 
+            (get active content)
+            (check-subscription subscriber (get artist content))
+            (>= current-block (get start-block content))
+            (<= current-block (get end-block content))
+        )
+    )
+)
+
+
+(define-map artist-bundles
+    uint
+    {
+        name: (string-ascii 50),
+        artists: (list 5 principal),
+        price: uint,
+        duration: uint,
+        active: bool
+    }
+)
+
+(define-data-var next-bundle-id uint u1)
+
+(define-public (create-artist-bundle (name (string-ascii 50)) (artists (list 5 principal)) (price uint) (duration uint))
+    (let ((bundle-id (var-get next-bundle-id)))
+        (map-set artist-bundles bundle-id
+            {
+                name: name,
+                artists: artists,
+                price: price,
+                duration: duration,
+                active: true
+            }
+        )
+        (var-set next-bundle-id (+ bundle-id u1))
+        (ok bundle-id)
+    )
+)
+
+(define-public (subscribe-to-bundle (bundle-id uint))
+    (let 
+        ((bundle (unwrap! (map-get? artist-bundles bundle-id) ERR-ARTWORK-NOT-FOUND))
+         (subscriber tx-sender)
+         (current-block stacks-block-height))
+        (try! (stx-transfer? (get price bundle) subscriber (unwrap! (element-at (get artists bundle) u0) ERR-ARTWORK-NOT-FOUND)))
+        (fold subscribe-artist-in-bundle (get artists bundle) (ok true))
+    )
+)
+
+(define-private (subscribe-artist-in-bundle (artist principal) (previous-result (response bool uint)))
+    (begin
+        (map-set subscriptions 
+            {subscriber: tx-sender, artist: artist}
+            {
+                expires-at: (+ stacks-block-height u144),
+                active: true
+            }
+        )
+        previous-result
+    )
+)
