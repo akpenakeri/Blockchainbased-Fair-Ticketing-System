@@ -660,7 +660,7 @@
         (ok content-id)
     )
 )
-
+;; TODO: can-access-premium-content
 ;; (define-read-only (can-access-premium-content (user principal) (content-id uint))
 ;;     (match (map-get? nft-gated-content content-id)
 ;;         content (match (contract-call? 
