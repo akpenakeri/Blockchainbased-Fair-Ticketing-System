@@ -545,3 +545,130 @@
         previous-result
     )
 )
+
+
+(define-map collaboration-events
+    uint
+    {
+        title: (string-ascii 100),
+        artists: (list 10 principal),
+        start-block: uint,
+        end-block: uint,
+        price: uint,
+        revenue-shares: (list 10 uint),
+        active: bool
+    }
+)
+
+(define-data-var next-collab-event-id uint u1)
+
+(define-public (create-collaboration-event 
+    (title (string-ascii 100))
+    (collaborating-artists (list 10 principal))
+    (duration uint)
+    (event-price uint)
+    (shares (list 10 uint)))
+    
+    (let ((event-id (var-get next-collab-event-id)))
+        (map-set collaboration-events event-id
+            {
+                title: title,
+                artists: collaborating-artists,
+                start-block: stacks-block-height,
+                end-block: (+ stacks-block-height duration),
+                price: event-price,
+                revenue-shares: shares,
+                active: true
+            }
+        )
+        (var-set next-collab-event-id (+ event-id u1))
+        (ok event-id)
+    )
+)
+
+(define-public (join-collaboration-event (event-id uint))
+    (let 
+        ((event (unwrap! (map-get? collaboration-events event-id) ERR-ARTWORK-NOT-FOUND))
+         (subscriber tx-sender)
+         (current-block stacks-block-height))
+        
+        (asserts! (get active event) (err u300))
+        (asserts! (<= current-block (get end-block event)) (err u301))
+        
+        (try! (distribute-event-revenue (get price event) (get artists event) (get revenue-shares event)))
+        (ok true)
+    )
+)
+
+(define-private (map-artists-shares (artists (list 10 principal)) (shares (list 10 uint)))
+    (map combine-artist-share artists shares)
+)
+
+(define-private (combine-artist-share (artist principal) (share uint))
+    {artist: artist, share: share}
+)
+
+(define-private (distribute-event-revenue (total-amount uint) (artists (list 10 principal)) (shares (list 10 uint)))
+    (fold distribute-to-artist (map combine-artist-share artists shares) (ok true))
+)
+
+(define-private (distribute-to-artist (artist-share {artist: principal, share: uint}) (previous-result (response bool uint)))
+    (begin
+        (try! (stx-transfer? (get share artist-share) tx-sender (get artist artist-share)))
+        (ok true)
+    )
+)
+
+
+(define-map nft-gated-content
+    uint
+    {
+        artist: principal,
+        title: (string-ascii 100),
+        nft-contract: principal,
+        required-token-id: uint,
+        content-uri: (string-ascii 256),
+        active: bool
+    }
+)
+
+(define-data-var next-premium-content-id uint u1)
+
+(define-trait nft-trait
+    ((get-owner (uint) (response principal uint))
+    (get-token-uri (uint) (response (optional (string-ascii 256)) uint)))
+)
+
+(define-public (create-nft-gated-content 
+    (title (string-ascii 100))
+    (nft-contract principal)
+    (token-id uint)
+    (content-uri (string-ascii 256)))
+    
+    (let ((content-id (var-get next-premium-content-id)))
+        (map-set nft-gated-content content-id
+            {
+                artist: tx-sender,
+                title: title,
+                nft-contract: nft-contract,
+                required-token-id: token-id,
+                content-uri: content-uri,
+                active: true
+            }
+        )
+        (var-set next-premium-content-id (+ content-id u1))
+        (ok content-id)
+    )
+)
+
+;; (define-read-only (can-access-premium-content (user principal) (content-id uint))
+;;     (match (map-get? nft-gated-content content-id)
+;;         content (match (contract-call? 
+;;                     (get nft-contract content)
+;;                     get-owner
+;;                     (get required-token-id content))
+;;                 success (is-eq success user)
+;;                 error false)
+;;         none false
+;;     )
+;; )
