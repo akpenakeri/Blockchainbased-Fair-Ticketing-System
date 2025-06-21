@@ -672,3 +672,131 @@
 ;;         none false
 ;;     )
 ;; )
+
+(define-constant ERR-AUTO-RENEWAL-NOT-FOUND (err u200))
+(define-constant ERR-INSUFFICIENT-BALANCE (err u201))
+(define-constant ERR-RENEWAL-NOT-DUE (err u202))
+(define-constant ERR-AUTO-RENEWAL-DISABLED (err u203))
+
+(define-map auto-renewals
+    {subscriber: principal, artist: principal}
+    {
+        enabled: bool,
+        max-price: uint,
+        renewal-buffer: uint,
+        created-at: uint,
+        last-renewal: uint
+    }
+)
+
+(define-map renewal-balances
+    principal
+    uint
+)
+
+(define-public (enable-auto-renewal (artist principal) (max-price uint) (renewal-buffer uint))
+    (let ((subscriber tx-sender))
+        (ok (map-set auto-renewals
+            {subscriber: subscriber, artist: artist}
+            {
+                enabled: true,
+                max-price: max-price,
+                renewal-buffer: renewal-buffer,
+                created-at: stacks-block-height,
+                last-renewal: u0
+            }
+        ))
+    )
+)
+
+(define-public (disable-auto-renewal (artist principal))
+    (let 
+        ((subscriber tx-sender)
+         (renewal-data (unwrap! (map-get? auto-renewals {subscriber: subscriber, artist: artist}) ERR-AUTO-RENEWAL-NOT-FOUND)))
+        (ok (map-set auto-renewals
+            {subscriber: subscriber, artist: artist}
+            (merge renewal-data {enabled: false})
+        ))
+    )
+)
+
+(define-public (deposit-renewal-funds (amount uint))
+    (let 
+        ((subscriber tx-sender)
+         (current-balance (default-to u0 (map-get? renewal-balances subscriber))))
+        (try! (stx-transfer? amount subscriber (as-contract tx-sender)))
+        (ok (map-set renewal-balances subscriber (+ current-balance amount)))
+    )
+)
+
+(define-public (withdraw-renewal-funds (amount uint))
+    (let 
+        ((subscriber tx-sender)
+         (current-balance (default-to u0 (map-get? renewal-balances subscriber))))
+        (asserts! (>= current-balance amount) ERR-INSUFFICIENT-BALANCE)
+        (try! (as-contract (stx-transfer? amount tx-sender subscriber)))
+        (ok (map-set renewal-balances subscriber (- current-balance amount)))
+    )
+)
+
+(define-public (process-auto-renewal (subscriber principal) (artist principal))
+    (let 
+        ((renewal-data (unwrap! (map-get? auto-renewals {subscriber: subscriber, artist: artist}) ERR-AUTO-RENEWAL-NOT-FOUND))
+         (subscription (unwrap! (map-get? subscriptions {subscriber: subscriber, artist: artist}) ERR-ARTWORK-NOT-FOUND))
+         (subscriber-balance (default-to u0 (map-get? renewal-balances subscriber)))
+         (current-block stacks-block-height)
+         (renewal-price u10000000))
+        
+        (asserts! (get enabled renewal-data) ERR-AUTO-RENEWAL-DISABLED)
+        (asserts! (<= renewal-price (get max-price renewal-data)) (err u204))
+        (asserts! (>= subscriber-balance renewal-price) ERR-INSUFFICIENT-BALANCE)
+        (asserts! (<= (- (get expires-at subscription) current-block) (get renewal-buffer renewal-data)) ERR-RENEWAL-NOT-DUE)
+        
+        (try! (as-contract (stx-transfer? renewal-price tx-sender artist)))
+        
+        (map-set renewal-balances subscriber (- subscriber-balance renewal-price))
+        
+        (map-set subscriptions
+            {subscriber: subscriber, artist: artist}
+            {
+                expires-at: (+ current-block u144),
+                active: true
+            }
+        )
+        
+        (map-set auto-renewals
+            {subscriber: subscriber, artist: artist}
+            (merge renewal-data {last-renewal: current-block})
+        )
+        
+        (ok true)
+    )
+)
+
+(define-read-only (get-auto-renewal-status (subscriber principal) (artist principal))
+    (map-get? auto-renewals {subscriber: subscriber, artist: artist})
+)
+
+(define-read-only (get-renewal-balance (subscriber principal))
+    (default-to u0 (map-get? renewal-balances subscriber))
+)
+
+(define-read-only (is-renewal-due (subscriber principal) (artist principal))
+    (match (map-get? auto-renewals {subscriber: subscriber, artist: artist})
+        renewal-data 
+            (match (map-get? subscriptions {subscriber: subscriber, artist: artist})
+                subscription
+                    (and 
+                        (get enabled renewal-data)
+                        (<= (- (get expires-at subscription) stacks-block-height) (get renewal-buffer renewal-data))
+                        (>= (default-to u0 (map-get? renewal-balances subscriber)) u10000000)
+                    )
+                false
+            )
+        false
+    )
+)
+
+(define-read-only (get-subscribers-due-for-renewal (artist principal))
+    (ok artist)
+)
