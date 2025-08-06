@@ -214,3 +214,837 @@
         ))
     )
 )
+
+
+
+;; Map to track subscription history for loyalty discounts
+(define-map subscription-history
+    principal
+    {
+        consecutive-subscriptions: uint,
+        total-subscriptions: uint,
+        last-subscription-block: uint
+    }
+)
+
+;; Constants for loyalty discounts
+(define-constant TIER1-DISCOUNT-THRESHOLD u3)  ;; 3 consecutive subscriptions
+(define-constant TIER2-DISCOUNT-THRESHOLD u6)  ;; 6 consecutive subscriptions
+(define-constant TIER1-DISCOUNT-PERCENT u10)   ;; 10% discount
+(define-constant TIER2-DISCOUNT-PERCENT u20)   ;; 20% discount
+
+;; Calculate discounted price based on loyalty
+(define-read-only (get-discounted-price (subscriber principal) (base-price uint))
+    (let 
+        ((history (default-to 
+                    {consecutive-subscriptions: u0, total-subscriptions: u0, last-subscription-block: u0} 
+                    (map-get? subscription-history subscriber)))
+         (consecutive (get consecutive-subscriptions history)))
+        
+        (if (>= consecutive TIER2-DISCOUNT-THRESHOLD)
+            ;; Apply 20% discount
+            (- base-price (/ (* base-price TIER2-DISCOUNT-PERCENT) u100))
+            (if (>= consecutive TIER1-DISCOUNT-THRESHOLD)
+                ;; Apply 10% discount
+                (- base-price (/ (* base-price TIER1-DISCOUNT-PERCENT) u100))
+                ;; No discount
+                base-price
+            )
+        )
+    )
+)
+
+;; Enhanced subscribe function with loyalty tracking
+(define-public (subscribe-with-loyalty (artist principal))
+    (let
+        ((subscriber tx-sender)
+         (artwork (unwrap! (map-get? artworks artist) ERR-ARTWORK-NOT-FOUND))
+         (current-block stacks-block-height)
+         (history (default-to 
+                    {consecutive-subscriptions: u0, total-subscriptions: u0, last-subscription-block: u0} 
+                    (map-get? subscription-history subscriber)))
+         (is-renewal (and 
+                        (> (get last-subscription-block history) u0)
+                        (< (- current-block (get last-subscription-block history)) u300))) ;; Consider renewal if within ~2 days
+         (consecutive (if is-renewal (+ (get consecutive-subscriptions history) u1) u1))
+         (total (+ (get total-subscriptions history) u1))
+         (discounted-price (get-discounted-price subscriber SUBSCRIPTION-PRICE)))
+        
+        ;; Transfer the discounted amount
+        (try! (stx-transfer? discounted-price subscriber artist))
+        
+        ;; Update subscription
+        (map-set subscriptions 
+            {subscriber: subscriber, artist: artist}
+            {
+                expires-at: (+ current-block u144), ;; ~1 day in blocks
+                active: true
+            }
+        )
+        
+        ;; Update loyalty history
+        (map-set subscription-history subscriber {
+            consecutive-subscriptions: consecutive,
+            total-subscriptions: total,
+            last-subscription-block: current-block
+        })
+        
+        (ok discounted-price)
+    )
+)
+
+
+
+;; Map to track tips
+(define-map artist-tips
+    principal
+    {
+        total-received: uint,
+        tip-count: uint,
+        last-tip-block: uint
+    }
+)
+
+;; Map to track tipper stats
+(define-map tipper-stats
+    {tipper: principal, artist: principal}
+    {
+        total-tipped: uint,
+        tip-count: uint,
+        last-tip-block: uint
+    }
+)
+
+;; Send a tip to an artist
+(define-public (tip-artist (artist principal) (amount uint))
+    (let 
+        ((tipper tx-sender)
+         (current-block stacks-block-height)
+         (artist-tip-data (default-to 
+                            {total-received: u0, tip-count: u0, last-tip-block: u0} 
+                            (map-get? artist-tips artist)))
+         (tipper-data (default-to 
+                        {total-tipped: u0, tip-count: u0, last-tip-block: u0} 
+                        (map-get? tipper-stats {tipper: tipper, artist: artist}))))
+        
+        ;; Transfer the tip amount
+        (try! (stx-transfer? amount tipper artist))
+        
+        ;; Update artist tip stats
+        (map-set artist-tips artist {
+            total-received: (+ (get total-received artist-tip-data) amount),
+            tip-count: (+ (get tip-count artist-tip-data) u1),
+            last-tip-block: current-block
+        })
+        
+        ;; Update tipper stats
+        (map-set tipper-stats {tipper: tipper, artist: artist} {
+            total-tipped: (+ (get total-tipped tipper-data) amount),
+            tip-count: (+ (get tip-count tipper-data) u1),
+            last-tip-block: current-block
+        })
+        
+        (ok true)
+    )
+)
+
+;; Get artist tip statistics
+(define-read-only (get-artist-tip-stats (artist principal))
+    (default-to 
+        {total-received: u0, tip-count: u0, last-tip-block: u0}
+        (map-get? artist-tips artist)
+    )
+)
+
+
+;; Enhanced gift subscriptions with messages
+(define-map enhanced-gift-subscriptions
+    {sender: principal, recipient: principal, artist: principal}
+    {
+        created-at: uint,
+        duration: uint,
+        redeemed: bool,
+        message: (string-ascii 200),
+        gift-name: (string-ascii 50)
+    }
+)
+
+;; Gift a subscription with a personalized message
+(define-public (gift-subscription-with-message 
+                (recipient principal) 
+                (artist principal) 
+                (message (string-ascii 200))
+                (gift-name (string-ascii 50)))
+    (let ((sender tx-sender))
+        ;; Transfer the subscription fee to the artist
+        (try! (stx-transfer? SUBSCRIPTION-PRICE sender artist))
+        
+        ;; Record the gift with message
+        (ok (map-set enhanced-gift-subscriptions
+            {sender: sender, recipient: recipient, artist: artist}
+            {
+                created-at: stacks-block-height, 
+                duration: u144, 
+                redeemed: false,
+                message: message,
+                gift-name: gift-name
+            }
+        ))
+    )
+)
+
+;; Redeem a gifted subscription
+(define-public (redeem-gift-subscription (sender principal) (artist principal))
+    (let 
+        ((recipient tx-sender)
+         (gift-data (unwrap! 
+                      (map-get? enhanced-gift-subscriptions 
+                        {sender: sender, recipient: recipient, artist: artist}) 
+                      (err u107)))
+         (current-block stacks-block-height))
+        
+        ;; Check if already redeemed
+        (asserts! (not (get redeemed gift-data)) (err u108))
+        
+        ;; Set up the subscription
+        (map-set subscriptions 
+            {subscriber: recipient, artist: artist}
+            {
+                expires-at: (+ current-block (get duration gift-data)),
+                active: true
+            }
+        )
+        
+        ;; Mark as redeemed
+        (map-set enhanced-gift-subscriptions
+            {sender: sender, recipient: recipient, artist: artist}
+            (merge gift-data {redeemed: true})
+        )
+        
+        (ok true)
+    )
+)
+
+;; Get gift details
+(define-read-only (get-gift-details (sender principal) (recipient principal) (artist principal))
+    (map-get? enhanced-gift-subscriptions {sender: sender, recipient: recipient, artist: artist})
+)
+
+
+
+;; Map to track collaborative artworks
+(define-map collaborative-artworks
+    uint
+    {
+        title: (string-ascii 100),
+        primary-artist: principal,
+        collaborators: (list 5 principal),
+        shares: (list 5 uint),
+        total-revenue: uint,
+        subscription-price: uint,
+        active: bool
+    }
+)
+
+;; Track collaborative artwork IDs
+(define-data-var next-collab-id uint u1)
+
+(define-map exclusive-content
+    uint
+    {
+        artist: principal,
+        title: (string-ascii 100),
+        start-block: uint,
+        end-block: uint,
+        active: bool
+    }
+)
+
+(define-data-var next-exclusive-id uint u1)
+
+(define-public (create-exclusive-content (title (string-ascii 100)) (duration uint))
+    (let 
+        ((content-id (var-get next-exclusive-id))
+         (current-block stacks-block-height))
+        (map-set exclusive-content content-id
+            {
+                artist: tx-sender,
+                title: title,
+                start-block: current-block,
+                end-block: (+ current-block duration),
+                active: true
+            }
+        )
+        (var-set next-exclusive-id (+ content-id u1))
+        (ok content-id)
+    )
+)
+
+(define-read-only (can-access-exclusive (subscriber principal) (content-id uint))
+    (let 
+        ((content (unwrap! (map-get? exclusive-content content-id) false))
+         (current-block stacks-block-height))
+        (and 
+            (get active content)
+            (check-subscription subscriber (get artist content))
+            (>= current-block (get start-block content))
+            (<= current-block (get end-block content))
+        )
+    )
+)
+
+
+(define-map artist-bundles
+    uint
+    {
+        name: (string-ascii 50),
+        artists: (list 5 principal),
+        price: uint,
+        duration: uint,
+        active: bool
+    }
+)
+
+(define-data-var next-bundle-id uint u1)
+
+(define-public (create-artist-bundle (name (string-ascii 50)) (artists (list 5 principal)) (price uint) (duration uint))
+    (let ((bundle-id (var-get next-bundle-id)))
+        (map-set artist-bundles bundle-id
+            {
+                name: name,
+                artists: artists,
+                price: price,
+                duration: duration,
+                active: true
+            }
+        )
+        (var-set next-bundle-id (+ bundle-id u1))
+        (ok bundle-id)
+    )
+)
+
+(define-public (subscribe-to-bundle (bundle-id uint))
+    (let 
+        ((bundle (unwrap! (map-get? artist-bundles bundle-id) ERR-ARTWORK-NOT-FOUND))
+         (subscriber tx-sender)
+         (current-block stacks-block-height))
+        (try! (stx-transfer? (get price bundle) subscriber (unwrap! (element-at (get artists bundle) u0) ERR-ARTWORK-NOT-FOUND)))
+        (fold subscribe-artist-in-bundle (get artists bundle) (ok true))
+    )
+)
+
+(define-private (subscribe-artist-in-bundle (artist principal) (previous-result (response bool uint)))
+    (begin
+        (map-set subscriptions 
+            {subscriber: tx-sender, artist: artist}
+            {
+                expires-at: (+ stacks-block-height u144),
+                active: true
+            }
+        )
+        previous-result
+    )
+)
+
+
+(define-map collaboration-events
+    uint
+    {
+        title: (string-ascii 100),
+        artists: (list 10 principal),
+        start-block: uint,
+        end-block: uint,
+        price: uint,
+        revenue-shares: (list 10 uint),
+        active: bool
+    }
+)
+
+(define-data-var next-collab-event-id uint u1)
+
+(define-public (create-collaboration-event 
+    (title (string-ascii 100))
+    (collaborating-artists (list 10 principal))
+    (duration uint)
+    (event-price uint)
+    (shares (list 10 uint)))
+    
+    (let ((event-id (var-get next-collab-event-id)))
+        (map-set collaboration-events event-id
+            {
+                title: title,
+                artists: collaborating-artists,
+                start-block: stacks-block-height,
+                end-block: (+ stacks-block-height duration),
+                price: event-price,
+                revenue-shares: shares,
+                active: true
+            }
+        )
+        (var-set next-collab-event-id (+ event-id u1))
+        (ok event-id)
+    )
+)
+
+(define-public (join-collaboration-event (event-id uint))
+    (let 
+        ((event (unwrap! (map-get? collaboration-events event-id) ERR-ARTWORK-NOT-FOUND))
+         (subscriber tx-sender)
+         (current-block stacks-block-height))
+        
+        (asserts! (get active event) (err u300))
+        (asserts! (<= current-block (get end-block event)) (err u301))
+        
+        (try! (distribute-event-revenue (get price event) (get artists event) (get revenue-shares event)))
+        (ok true)
+    )
+)
+
+(define-private (map-artists-shares (artists (list 10 principal)) (shares (list 10 uint)))
+    (map combine-artist-share artists shares)
+)
+
+(define-private (combine-artist-share (artist principal) (share uint))
+    {artist: artist, share: share}
+)
+
+(define-private (distribute-event-revenue (total-amount uint) (artists (list 10 principal)) (shares (list 10 uint)))
+    (fold distribute-to-artist (map combine-artist-share artists shares) (ok true))
+)
+
+(define-private (distribute-to-artist (artist-share {artist: principal, share: uint}) (previous-result (response bool uint)))
+    (begin
+        (try! (stx-transfer? (get share artist-share) tx-sender (get artist artist-share)))
+        (ok true)
+    )
+)
+
+
+(define-map nft-gated-content
+    uint
+    {
+        artist: principal,
+        title: (string-ascii 100),
+        nft-contract: principal,
+        required-token-id: uint,
+        content-uri: (string-ascii 256),
+        active: bool
+    }
+)
+
+(define-data-var next-premium-content-id uint u1)
+
+(define-trait nft-trait
+    ((get-owner (uint) (response principal uint))
+    (get-token-uri (uint) (response (optional (string-ascii 256)) uint)))
+)
+
+(define-public (create-nft-gated-content 
+    (title (string-ascii 100))
+    (nft-contract principal)
+    (token-id uint)
+    (content-uri (string-ascii 256)))
+    
+    (let ((content-id (var-get next-premium-content-id)))
+        (map-set nft-gated-content content-id
+            {
+                artist: tx-sender,
+                title: title,
+                nft-contract: nft-contract,
+                required-token-id: token-id,
+                content-uri: content-uri,
+                active: true
+            }
+        )
+        (var-set next-premium-content-id (+ content-id u1))
+        (ok content-id)
+    )
+)
+;; TODO: can-access-premium-content
+;; (define-read-only (can-access-premium-content (user principal) (content-id uint))
+;;     (match (map-get? nft-gated-content content-id)
+;;         content (match (contract-call? 
+;;                     (get nft-contract content)
+;;                     get-owner
+;;                     (get required-token-id content))
+;;                 success (is-eq success user)
+;;                 error false)
+;;         none false
+;;     )
+;; )
+
+(define-constant ERR-AUTO-RENEWAL-NOT-FOUND (err u200))
+(define-constant ERR-INSUFFICIENT-BALANCE (err u201))
+(define-constant ERR-RENEWAL-NOT-DUE (err u202))
+(define-constant ERR-AUTO-RENEWAL-DISABLED (err u203))
+
+(define-map auto-renewals
+    {subscriber: principal, artist: principal}
+    {
+        enabled: bool,
+        max-price: uint,
+        renewal-buffer: uint,
+        created-at: uint,
+        last-renewal: uint
+    }
+)
+
+(define-map renewal-balances
+    principal
+    uint
+)
+
+(define-public (enable-auto-renewal (artist principal) (max-price uint) (renewal-buffer uint))
+    (let ((subscriber tx-sender))
+        (ok (map-set auto-renewals
+            {subscriber: subscriber, artist: artist}
+            {
+                enabled: true,
+                max-price: max-price,
+                renewal-buffer: renewal-buffer,
+                created-at: stacks-block-height,
+                last-renewal: u0
+            }
+        ))
+    )
+)
+
+(define-public (disable-auto-renewal (artist principal))
+    (let 
+        ((subscriber tx-sender)
+         (renewal-data (unwrap! (map-get? auto-renewals {subscriber: subscriber, artist: artist}) ERR-AUTO-RENEWAL-NOT-FOUND)))
+        (ok (map-set auto-renewals
+            {subscriber: subscriber, artist: artist}
+            (merge renewal-data {enabled: false})
+        ))
+    )
+)
+
+(define-public (deposit-renewal-funds (amount uint))
+    (let 
+        ((subscriber tx-sender)
+         (current-balance (default-to u0 (map-get? renewal-balances subscriber))))
+        (try! (stx-transfer? amount subscriber (as-contract tx-sender)))
+        (ok (map-set renewal-balances subscriber (+ current-balance amount)))
+    )
+)
+
+(define-public (withdraw-renewal-funds (amount uint))
+    (let 
+        ((subscriber tx-sender)
+         (current-balance (default-to u0 (map-get? renewal-balances subscriber))))
+        (asserts! (>= current-balance amount) ERR-INSUFFICIENT-BALANCE)
+        (try! (as-contract (stx-transfer? amount tx-sender subscriber)))
+        (ok (map-set renewal-balances subscriber (- current-balance amount)))
+    )
+)
+
+(define-public (process-auto-renewal (subscriber principal) (artist principal))
+    (let 
+        ((renewal-data (unwrap! (map-get? auto-renewals {subscriber: subscriber, artist: artist}) ERR-AUTO-RENEWAL-NOT-FOUND))
+         (subscription (unwrap! (map-get? subscriptions {subscriber: subscriber, artist: artist}) ERR-ARTWORK-NOT-FOUND))
+         (subscriber-balance (default-to u0 (map-get? renewal-balances subscriber)))
+         (current-block stacks-block-height)
+         (renewal-price u10000000))
+        
+        (asserts! (get enabled renewal-data) ERR-AUTO-RENEWAL-DISABLED)
+        (asserts! (<= renewal-price (get max-price renewal-data)) (err u204))
+        (asserts! (>= subscriber-balance renewal-price) ERR-INSUFFICIENT-BALANCE)
+        (asserts! (<= (- (get expires-at subscription) current-block) (get renewal-buffer renewal-data)) ERR-RENEWAL-NOT-DUE)
+        
+        (try! (as-contract (stx-transfer? renewal-price tx-sender artist)))
+        
+        (map-set renewal-balances subscriber (- subscriber-balance renewal-price))
+        
+        (map-set subscriptions
+            {subscriber: subscriber, artist: artist}
+            {
+                expires-at: (+ current-block u144),
+                active: true
+            }
+        )
+        
+        (map-set auto-renewals
+            {subscriber: subscriber, artist: artist}
+            (merge renewal-data {last-renewal: current-block})
+        )
+        
+        (ok true)
+    )
+)
+
+(define-read-only (get-auto-renewal-status (subscriber principal) (artist principal))
+    (map-get? auto-renewals {subscriber: subscriber, artist: artist})
+)
+
+(define-read-only (get-renewal-balance (subscriber principal))
+    (default-to u0 (map-get? renewal-balances subscriber))
+)
+
+(define-read-only (is-renewal-due (subscriber principal) (artist principal))
+    (match (map-get? auto-renewals {subscriber: subscriber, artist: artist})
+        renewal-data 
+            (match (map-get? subscriptions {subscriber: subscriber, artist: artist})
+                subscription
+                    (and 
+                        (get enabled renewal-data)
+                        (<= (- (get expires-at subscription) stacks-block-height) (get renewal-buffer renewal-data))
+                        (>= (default-to u0 (map-get? renewal-balances subscriber)) u10000000)
+                    )
+                false
+            )
+        false
+    )
+)
+
+(define-read-only (get-subscribers-due-for-renewal (artist principal))
+    (ok artist)
+)
+
+;; Artist Leaderboard & Reputation System Constants
+(define-constant REPUTATION-SUBSCRIBER-MULTIPLIER u10)
+(define-constant REPUTATION-TIP-MULTIPLIER u2)
+(define-constant REPUTATION-ARTWORK-MULTIPLIER u50)
+(define-constant REPUTATION-COLLABORATION-MULTIPLIER u25)
+(define-constant REPUTATION-DECAY-RATE u1)
+(define-constant LEADERBOARD-SIZE u50)
+
+;; Artist reputation tracking
+(define-map artist-reputation
+    principal
+    {
+        total-score: uint,
+        subscriber-score: uint,
+        tip-score: uint,
+        activity-score: uint,
+        collaboration-score: uint,
+        last-updated: uint,
+        rank: uint
+    }
+)
+
+;; Leaderboard state
+(define-map leaderboard-positions
+    uint
+    {
+        artist: principal,
+        score: uint,
+        rank: uint
+    }
+)
+
+(define-data-var total-leaderboard-entries uint u0)
+(define-data-var last-leaderboard-update uint u0)
+
+;; Reputation milestone rewards
+(define-map reputation-milestones
+    uint
+    {
+        threshold: uint,
+        reward-amount: uint,
+        badge-name: (string-ascii 50)
+    }
+)
+
+(define-map artist-achievements
+    principal
+    {
+        milestones-reached: (list 10 uint),
+        total-rewards: uint,
+        highest-rank: uint
+    }
+)
+
+;; Initialize reputation milestones
+(define-public (initialize-milestones)
+    (begin
+        (map-set reputation-milestones u1 {threshold: u1000, reward-amount: u1000000, badge-name: "Rising Star"})
+        (map-set reputation-milestones u2 {threshold: u5000, reward-amount: u5000000, badge-name: "Established Creator"})
+        (map-set reputation-milestones u3 {threshold: u10000, reward-amount: u10000000, badge-name: "Top Artist"})
+        (map-set reputation-milestones u4 {threshold: u25000, reward-amount: u25000000, badge-name: "Art Legend"})
+        (ok true)
+    )
+)
+
+;; Calculate reputation score for an artist
+(define-read-only (calculate-reputation-score (artist principal))
+    (let 
+        ((tip-data (get-artist-tip-stats artist))
+         (artwork-data (get-artwork artist))
+         (current-block stacks-block-height)
+         (reputation-data (default-to 
+                           {total-score: u0, subscriber-score: u0, tip-score: u0, activity-score: u0, collaboration-score: u0, last-updated: u0, rank: u0}
+                           (map-get? artist-reputation artist)))
+         (blocks-since-update (if (> (get last-updated reputation-data) u0) 
+                                (- current-block (get last-updated reputation-data)) 
+                                u0))
+         (decay-amount (/ (* (get total-score reputation-data) blocks-since-update REPUTATION-DECAY-RATE) u1000))
+         (tip-score (* (get total-received tip-data) REPUTATION-TIP-MULTIPLIER))
+         (artwork-score (if (is-some artwork-data) REPUTATION-ARTWORK-MULTIPLIER u0))
+         (collaboration-score (get collaboration-score reputation-data))
+         (base-score (+ tip-score artwork-score collaboration-score))
+         (decayed-score (if (> base-score decay-amount) (- base-score decay-amount) u0)))
+        decayed-score
+    )
+)
+
+;; Update artist reputation
+(define-public (update-artist-reputation (artist principal))
+    (let 
+        ((new-score (calculate-reputation-score artist))
+         (current-reputation (default-to 
+                              {total-score: u0, subscriber-score: u0, tip-score: u0, activity-score: u0, collaboration-score: u0, last-updated: u0, rank: u0}
+                              (map-get? artist-reputation artist)))
+         (tip-data (get-artist-tip-stats artist))
+         (tip-score (* (get total-received tip-data) REPUTATION-TIP-MULTIPLIER))
+         (artwork-score (if (is-some (get-artwork artist)) REPUTATION-ARTWORK-MULTIPLIER u0))
+         (collaboration-score (get collaboration-score current-reputation)))
+        
+        (map-set artist-reputation artist {
+            total-score: new-score,
+            subscriber-score: u0,
+            tip-score: tip-score,
+            activity-score: artwork-score,
+            collaboration-score: collaboration-score,
+            last-updated: stacks-block-height,
+            rank: (get rank current-reputation)
+        })
+        
+        (ok new-score)
+    )
+)
+
+;; Get artist reputation
+(define-read-only (get-artist-reputation (artist principal))
+    (default-to 
+        {total-score: u0, subscriber-score: u0, tip-score: u0, activity-score: u0, collaboration-score: u0, last-updated: u0, rank: u0}
+        (map-get? artist-reputation artist)
+    )
+)
+
+;; Update leaderboard with new scores
+(define-public (refresh-leaderboard)
+    (let ((current-block stacks-block-height))
+        (var-set last-leaderboard-update current-block)
+        (ok true)
+    )
+)
+
+;; Get leaderboard position
+(define-read-only (get-leaderboard-position (rank uint))
+    (map-get? leaderboard-positions rank)
+)
+
+;; Get artist rank
+(define-read-only (get-artist-rank (artist principal))
+    (let ((reputation (get-artist-reputation artist)))
+        (get rank reputation)
+    )
+)
+
+;; Get top artists
+(define-read-only (get-top-artists (count uint))
+    (let ((max-count (if (> count LEADERBOARD-SIZE) LEADERBOARD-SIZE count)))
+        (map get-leaderboard-position (generate-sequence max-count))
+    )
+)
+
+;; Helper function to generate sequence
+(define-private (generate-sequence (n uint))
+    (if (is-eq n u0) 
+        (list)
+        (if (is-eq n u1)
+            (list u1)
+            (if (is-eq n u2)
+                (list u1 u2)
+                (if (is-eq n u3)
+                    (list u1 u2 u3)
+                    (if (is-eq n u4)
+                        (list u1 u2 u3 u4)
+                        (if (is-eq n u5)
+                            (list u1 u2 u3 u4 u5)
+                            (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+                        )
+                    )
+                )
+            )
+        )
+    )
+)
+
+;; Award reputation for collaborations
+(define-public (award-collaboration-reputation (artist principal) (points uint))
+    (let 
+        ((current-reputation (get-artist-reputation artist))
+         (new-collaboration-score (+ (get collaboration-score current-reputation) points))
+         (new-total-score (+ (get total-score current-reputation) points)))
+        
+        (map-set artist-reputation artist 
+            (merge current-reputation {
+                collaboration-score: new-collaboration-score,
+                total-score: new-total-score,
+                last-updated: stacks-block-height
+            })
+        )
+        
+        ;; (try! (check-milestone-achievement artist new-total-score))
+        (ok true)
+    )
+)
+
+;; Check if artist reached new milestone
+
+
+;; Award milestone reward
+(define-private (award-milestone-reward (artist principal) (milestone-id uint))
+    (let 
+        ((milestone (unwrap! (map-get? reputation-milestones milestone-id) (err u400)))
+         (current-achievements (default-to 
+                                {milestones-reached: (list), total-rewards: u0, highest-rank: u0}
+                                (map-get? artist-achievements artist)))
+         (new-milestones (unwrap! (as-max-len? (append (get milestones-reached current-achievements) milestone-id) u10) (err u401)))
+         (reward-amount (get reward-amount milestone)))
+        
+        (try! (as-contract (stx-transfer? reward-amount tx-sender artist)))
+        
+        (map-set artist-achievements artist {
+            milestones-reached: new-milestones,
+            total-rewards: (+ (get total-rewards current-achievements) reward-amount),
+            highest-rank: (get highest-rank current-achievements)
+        })
+        
+        (ok true)
+    )
+)
+
+;; Get artist achievements
+(define-read-only (get-artist-achievements (artist principal))
+    (default-to 
+        {milestones-reached: (list), total-rewards: u0, highest-rank: u0}
+        (map-get? artist-achievements artist)
+    )
+)
+
+;; Get milestone info
+(define-read-only (get-milestone-info (milestone-id uint))
+    (map-get? reputation-milestones milestone-id)
+)
+
+;; Enhanced tip function with reputation update
+(define-public (tip-artist-with-reputation (artist principal) (amount uint))
+    (let ((result (tip-artist artist amount)))
+        (try! result)
+        (unwrap! (update-artist-reputation artist) 
+            (err u500))
+        (ok true)
+    )
+)
+
+;; Enhanced subscription function with reputation update
+(define-public (subscribe-with-reputation-boost (artist principal))
+    (let ((result (subscribe-to-artist artist)))
+        (try! result)
+        (unwrap! (award-collaboration-reputation artist REPUTATION-SUBSCRIBER-MULTIPLIER) (err u501))
+        (ok true)
+    )
+)
